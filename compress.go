@@ -27,11 +27,13 @@ func newZlibPool() *compIOZlibPool {
 		var err error
 		p.pools[i].New = func() any {
 			c := &compIO{}
-			c.zr = nil
+			c.mc = nil
+			c.buff = bytes.Buffer{}
 			c.zw, err = zlib.NewWriterLevel(&c.buff, i)
 			if err != nil {
 				panic(err)
 			}
+			c.zr = nil
 			return c
 		}
 	}
@@ -77,9 +79,12 @@ type compIO struct {
 }
 
 func newCompIO(mc *mysqlConn) *compIO {
-	c := zlibPool.pools[mc.cfg.compressLevel].Get()
-	c.(*compIO).mc = mc
-	return c.(*compIO)
+	c, ok := zlibPool.pools[mc.cfg.compressLevel].Get().(*compIO)
+	if !ok {
+		panic(fmt.Sprintf("unexpected type %T", c))
+	}
+	c.mc = mc
+	return c
 }
 
 func (c *compIO) close() {
