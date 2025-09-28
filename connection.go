@@ -179,7 +179,9 @@ func (mc *mysqlConn) cleanup() {
 	if mc.closed.Swap(true) {
 		return
 	}
-
+	if mc.compress {
+		mc.compIO.close()
+	}
 	// Makes cleanup idempotent
 	close(mc.closech)
 	conn := mc.rawConn

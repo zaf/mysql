@@ -12,9 +12,33 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/klauspost/compress/zlib"
 )
+
+type compIOZlibPool struct {
+	pools [zlib.BestCompression]sync.Pool
+}
+
+func newZlibPool() *compIOZlibPool {
+	p := &compIOZlibPool{}
+	for i := range p.pools {
+		var err error
+		p.pools[i].New = func() any {
+			c := &compIO{}
+			c.zr = nil
+			c.zw, err = zlib.NewWriterLevel(&c.buff, i)
+			if err != nil {
+				panic(err)
+			}
+			return c
+		}
+	}
+	return p
+}
+
+var zlibPool = newZlibPool()
 
 func (c *compIO) zDecompress(src []byte) (int, error) {
 	br := bytes.NewReader(src)
@@ -36,11 +60,12 @@ func (c *compIO) zDecompress(src []byte) (int, error) {
 }
 
 func (c *compIO) zCompress(src []byte) error {
+	var err error
 	c.zw.Reset(&c.buff)
 	if _, err := c.zw.Write(src); err != nil {
 		return err
 	}
-	err := c.zw.Close()
+	err = c.zw.Close()
 	return err
 }
 
@@ -52,15 +77,16 @@ type compIO struct {
 }
 
 func newCompIO(mc *mysqlConn) *compIO {
-	w, err := zlib.NewWriterLevel(new(bytes.Buffer), mc.cfg.compressLevel)
-	if err != nil {
-		panic(err) // compress/zlib return non-nil error only if level is invalid
-	}
-	return &compIO{
-		mc: mc,
-		zw: w,
-		zr: nil,
-	}
+	c := zlibPool.pools[mc.cfg.compressLevel].Get()
+	c.(*compIO).mc = mc
+	return c.(*compIO)
+}
+
+func (c *compIO) close() {
+	level := c.mc.cfg.compressLevel
+	c.mc = nil
+	c.reset()
+	zlibPool.pools[level].Put(c)
 }
 
 func (c *compIO) reset() {
@@ -130,11 +156,12 @@ func (c *compIO) readCompressedPacket() error {
 const minCompressLength = 150
 const maxPayloadLen = maxPacketSize - 4
 
+var blankHeader = make([]byte, 7)
+
 // writePackets sends one or some packets with compression.
 // Use this instead of mc.netConn.Write() when mc.compress is true.
 func (c *compIO) writePackets(packets []byte) (int, error) {
 	totalBytes := len(packets)
-	blankHeader := make([]byte, 7)
 	buf := &c.buff
 
 	for len(packets) > 0 {
@@ -164,7 +191,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 			}
 		}
 
-		if n, err := c.writeCompressedPacket(buf.Bytes(), uncompressedLen); err != nil {
+		if n, err := c.writeCompressedPacket(uncompressedLen); err != nil {
 			// To allow returning ErrBadConn when sending really 0 bytes, we sum
 			// up compressed bytes that is returned by underlying Write().
 			return totalBytes - len(packets) + n, err
@@ -177,8 +204,9 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 
 // writeCompressedPacket writes a compressed packet with header.
 // data should start with 7 size space for header followed by payload.
-func (c *compIO) writeCompressedPacket(data []byte, uncompressedLen int) (int, error) {
+func (c *compIO) writeCompressedPacket(uncompressedLen int) (int, error) {
 	mc := c.mc
+	data := c.buff.Bytes()
 	comprLength := len(data) - 7
 	if debug {
 		fmt.Printf(
