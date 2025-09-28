@@ -17,19 +17,54 @@ import (
 	"github.com/klauspost/compress/zlib"
 )
 
+const (
+	compHeaderSize = 7
+)
+
+// compIOZlibPool is a bucket of compIO pools using zlib compression, one for each compression level
 type compIOZlibPool struct {
-	pools [zlib.BestCompression]sync.Pool
+	pools [zlib.BestCompression + 1]sync.Pool
+}
+
+var (
+	zlibPool    compIOZlibPool
+	blankHeader []byte
+)
+
+func init() {
+	blankHeader = make([]byte, compHeaderSize)
+	zlibPool = *newZlibPool()
+}
+
+// compHeader holds the data of a MySQl compressed packet header
+type compHeader struct {
+	CompressedLength   int
+	Sequence           uint8
+	UncompressedLength int
+}
+
+func (h *compHeader) read(data []byte) {
+	h.CompressedLength = getUint24(data[0:3])
+	h.Sequence = data[3]
+	h.UncompressedLength = getUint24(data[4:7])
+}
+
+func (h *compHeader) write(data []byte) {
+	putUint24(data[0:3], h.CompressedLength)
+	data[3] = h.Sequence
+	putUint24(data[4:7], h.UncompressedLength)
 }
 
 func newZlibPool() *compIOZlibPool {
 	p := &compIOZlibPool{}
 	for i := range p.pools {
 		var err error
+		level := i
 		p.pools[i].New = func() any {
 			c := &compIO{}
 			c.mc = nil
 			c.buff = bytes.Buffer{}
-			c.zw, err = zlib.NewWriterLevel(&c.buff, i)
+			c.zw, err = zlib.NewWriterLevel(&c.buff, level)
 			if err != nil {
 				panic(err)
 			}
@@ -39,8 +74,6 @@ func newZlibPool() *compIOZlibPool {
 	}
 	return p
 }
-
-var zlibPool = newZlibPool()
 
 func (c *compIO) zDecompress(src []byte) (int, error) {
 	br := bytes.NewReader(src)
@@ -115,53 +148,50 @@ func (c *compIO) readCompressedPacket() error {
 	}
 	_ = header[6] // bounds check hint to compiler; guaranteed by readNext
 
-	// compressed header structure
-	comprLength := getUint24(header[0:3])
-	compressionSequence := header[3]
-	uncompressedLength := getUint24(header[4:7])
+	// Read compressed header data
+	h := &compHeader{}
+	h.read(header)
 	if debug {
 		fmt.Printf("uncompress cmplen=%v uncomplen=%v pkt_cmp_seq=%v expected_cmp_seq=%v\n",
-			comprLength, uncompressedLength, compressionSequence, c.mc.sequence)
+			h.CompressedLength, h.UncompressedLength, h.Sequence, c.mc.sequence)
 	}
 	// Do not return ErrPktSync here.
 	// Server may return error packet (e.g. 1153 Got a packet bigger than 'max_allowed_packet' bytes)
 	// before receiving all packets from client. In this case, seqnr is younger than expected.
 	// NOTE: Both of mariadbclient and mysqlclient do not check seqnr. Only server checks it.
-	if debug && compressionSequence != c.mc.compressSequence {
+	if debug && h.Sequence != c.mc.compressSequence {
 		fmt.Printf("WARN: unexpected cmpress seq nr: expected %v, got %v",
-			c.mc.compressSequence, compressionSequence)
+			c.mc.compressSequence, h.Sequence)
 	}
-	c.mc.compressSequence = compressionSequence + 1
+	c.mc.compressSequence = h.Sequence + 1
 
-	comprData, err := c.mc.readNext(comprLength)
+	comprData, err := c.mc.readNext(h.CompressedLength)
 	if err != nil {
 		return err
 	}
 
 	// if payload is uncompressed, its length will be specified as zero, and its
 	// true length is contained in comprLength
-	if uncompressedLength == 0 {
+	if h.UncompressedLength == 0 {
 		c.buff.Write(comprData)
 		return nil
 	}
 
 	// use existing capacity in bytesBuf if possible
-	c.buff.Grow(uncompressedLength)
+	c.buff.Grow(h.UncompressedLength)
 	nread, err := c.zDecompress(comprData)
 	if err != nil {
 		return err
 	}
-	if nread != uncompressedLength {
+	if nread != h.UncompressedLength {
 		return fmt.Errorf("invalid compressed packet: uncompressed length in header is %d, actual %d",
-			uncompressedLength, nread)
+			h.UncompressedLength, nread)
 	}
 	return nil
 }
 
 const minCompressLength = 150
 const maxPayloadLen = maxPacketSize - 4
-
-var blankHeader = make([]byte, 7)
 
 // writePackets sends one or some packets with compression.
 // Use this instead of mc.netConn.Write() when mc.compress is true.
@@ -170,17 +200,18 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 	buf := &c.buff
 
 	for len(packets) > 0 {
+		header := &compHeader{}
 		payloadLen := min(maxPayloadLen, len(packets))
 		payload := packets[:payloadLen]
-		uncompressedLen := payloadLen
+		header.UncompressedLength = payloadLen
 
 		buf.Reset()
 		buf.Write(blankHeader) // Buffer.Write() never returns error
 
 		// If payload is less than minCompressLength, don't compress.
-		if uncompressedLen < minCompressLength {
+		if header.UncompressedLength < minCompressLength {
 			buf.Write(payload)
-			uncompressedLen = 0
+			header.UncompressedLength = 0
 		} else {
 			err := c.zCompress(payload)
 			if debug && err != nil {
@@ -188,15 +219,17 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 			}
 			// do not compress if compressed data is larger than uncompressed data
 			// I intentionally miss 7 byte header in the buf; zCompress must compress more than 7 bytes.
-			if err != nil || buf.Len() >= uncompressedLen {
+			if err != nil || buf.Len() >= header.UncompressedLength {
 				buf.Reset()
 				buf.Write(blankHeader)
 				buf.Write(payload)
-				uncompressedLen = 0
+				header.UncompressedLength = 0
 			}
 		}
+		header.CompressedLength = buf.Len() - compHeaderSize
+		header.Sequence = c.mc.compressSequence
 
-		if n, err := c.writeCompressedPacket(uncompressedLen); err != nil {
+		if n, err := c.writeCompressedPacket(header); err != nil {
 			// To allow returning ErrBadConn when sending really 0 bytes, we sum
 			// up compressed bytes that is returned by underlying Write().
 			return totalBytes - len(packets) + n, err
@@ -209,21 +242,14 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 
 // writeCompressedPacket writes a compressed packet with header.
 // data should start with 7 size space for header followed by payload.
-func (c *compIO) writeCompressedPacket(uncompressedLen int) (int, error) {
-	mc := c.mc
+func (c *compIO) writeCompressedPacket(header *compHeader) (int, error) {
 	data := c.buff.Bytes()
-	comprLength := len(data) - 7
+	header.write(data)
 	if debug {
 		fmt.Printf(
 			"writeCompressedPacket: comprLength=%v, uncompressedLen=%v, seq=%v\n",
-			comprLength, uncompressedLen, mc.compressSequence)
+			header.CompressedLength, header.UncompressedLength, header.Sequence)
 	}
-
-	// compression header
-	putUint24(data[0:3], comprLength)
-	data[3] = mc.compressSequence
-	putUint24(data[4:7], uncompressedLen)
-
-	mc.compressSequence++
-	return mc.writeWithTimeout(data)
+	c.mc.compressSequence++
+	return c.mc.writeWithTimeout(data)
 }
