@@ -153,7 +153,7 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 		zs.reader, err = zstd.NewReader(zs.buffReader,
 			zstd.WithDecoderLowmem(true),
 			zstd.WithDecoderConcurrency(1),
-			zstd.WithDecoderMaxMemory(1<<30),
+			zstd.WithDecoderMaxMemory(16<<20), // 16MB
 		)
 		if err != nil {
 			return 0, err
@@ -184,7 +184,7 @@ func newZstdPool() *compIOZstdPool {
 				zstd.WithEncoderLevel(zstd.EncoderLevel(level)),
 				zstd.WithLowerEncoderMem(true),
 				zstd.WithEncoderConcurrency(1),
-				zstd.WithWindowSize(1<<20),
+				zstd.WithWindowSize(1<<18), // 256KB
 			)
 			if err != nil {
 				panic(err)
@@ -240,7 +240,7 @@ func (c *compIO) close() {
 	zlibPool.pools[level].Put(c)
 }
 
-const maxPoolBufferSize = 1 << 20 // 1MB
+const maxPoolBufferSize = 1 << 19 // 512KB
 
 func (c *compIO) reset() {
 	// Reset large buffers to avoid memory bloat in the pool
