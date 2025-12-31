@@ -45,7 +45,7 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
 
 ## Requirements
 
-* Go 1.22 or higher. We aim to support the 3 latest versions of Go.
+* Go 1.23 or higher. We aim to support the 3 latest versions of Go.
 * MySQL (5.7+) and MariaDB (10.5+) are supported.
 * [TiDB](https://github.com/pingcap/tidb) is supported by PingCAP.
   * Do not ask questions about TiDB in our issue tracker or forum.
@@ -288,6 +288,7 @@ Type:           decimal number
 Valid Values:   1-9
 Default:        2
 ```
+Sets the zlib compression level on the client side.
 
 ##### `zstdCompress`
 
@@ -297,7 +298,7 @@ Valid Values:   true, false
 Default:        false
 ```
 
-Toggles zstd compression. false by default.
+Toggles zstd compression. false by default. Not supported in MySQL < 8.0 and MariaDB
 
 ##### `zstdCompressLevel`
 

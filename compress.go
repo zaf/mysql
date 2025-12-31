@@ -59,11 +59,13 @@ func (h *compHeader) write(data []byte) {
 	putUint24(data[4:7], h.UncompressedLength)
 }
 
+// compressor interface
 type compressor interface {
 	compress(src []byte, dst io.Writer) error
 	uncompress(src []byte, dst io.ReaderFrom) (int, error)
 }
 
+// zlibCompressor implements the compressor interface using zlib
 type zlibCompressor struct {
 	writer *zlib.Writer
 	reader io.ReadCloser
@@ -118,6 +120,7 @@ func newZlibPool() *compIOZlibPool {
 	return p
 }
 
+// zstdCompressor implements the compressor interface using zstd
 type zstdCompressor struct {
 	writer *zstd.Encoder
 	reader io.Reader
@@ -137,7 +140,11 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 	br := bytes.NewReader(src)
 	var err error
 	if zs.reader == nil {
-		zs.reader, err = zstd.NewReader(br, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1<<30))
+		zs.reader, err = zstd.NewReader(br,
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(1<<30),
+		)
 		if err != nil {
 			return 0, err
 		}
@@ -148,7 +155,10 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 		}
 	}
 	n, err := dst.ReadFrom(zs.reader)
-	zs.reader.(*zstd.Decoder).Reset(nil)
+	if err != nil {
+		return 0, err
+	}
+	err = zs.reader.(*zstd.Decoder).Reset(nil)
 	return int(n), err
 }
 
@@ -160,7 +170,12 @@ func newZstdPool() *compIOZstdPool {
 			c := &compIO{}
 			c.buff = bytes.Buffer{}
 			c.mc = nil
-			writer, err := zstd.NewWriter(&c.buff, zstd.WithEncoderLevel(zstd.EncoderLevel(level)), zstd.WithLowerEncoderMem(true), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(1<<20))
+			writer, err := zstd.NewWriter(&c.buff,
+				zstd.WithEncoderLevel(zstd.EncoderLevel(level)),
+				zstd.WithLowerEncoderMem(true),
+				zstd.WithEncoderConcurrency(1),
+				zstd.WithWindowSize(1<<20),
+			)
 			if err != nil {
 				panic(err)
 			}
@@ -182,7 +197,8 @@ func newCompIO(mc *mysqlConn) *compIO {
 		inintzstdPool.Do(func() {
 			zstdPool = newZstdPool()
 		})
-		c, ok := zstdPool.pools[zstd.EncoderLevelFromZstd(mc.cfg.zstdCompressionLevel)].Get().(*compIO)
+		level := zstd.EncoderLevelFromZstd(mc.cfg.zstdCompressionLevel)
+		c, ok := zstdPool.pools[level].Get().(*compIO)
 		if !ok {
 			panic(fmt.Sprintf("unexpected zstdPool type %T", c))
 		}
@@ -302,7 +318,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 		} else {
 			err := c.comp.compress(payload, buf)
 			if debug && err != nil {
-				fmt.Printf("zCompress error: %v", err)
+				fmt.Printf("compress error: %v", err)
 			}
 			// do not compress if compressed data is larger than uncompressed data
 			// I intentionally miss 7 byte header in the buf; zCompress must compress more than 7 bytes.
