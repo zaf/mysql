@@ -137,7 +137,7 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 	br := bytes.NewReader(src)
 	var err error
 	if zs.reader == nil {
-		zs.reader, err = zstd.NewReader(br)
+		zs.reader, err = zstd.NewReader(br, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(1<<30))
 		if err != nil {
 			return 0, err
 		}
@@ -160,7 +160,7 @@ func newZstdPool() *compIOZstdPool {
 			c := &compIO{}
 			c.buff = bytes.Buffer{}
 			c.mc = nil
-			writer, err := zstd.NewWriter(&c.buff, zstd.WithEncoderLevel(zstd.EncoderLevel(level)))
+			writer, err := zstd.NewWriter(&c.buff, zstd.WithEncoderLevel(zstd.EncoderLevel(level)), zstd.WithLowerEncoderMem(true), zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(1<<20))
 			if err != nil {
 				panic(err)
 			}
