@@ -148,7 +148,7 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 		}
 	}
 	n, err := dst.ReadFrom(zs.reader)
-	zs.reader.(*zstd.Decoder).Close()
+	zs.reader.(*zstd.Decoder).Reset(nil)
 	return int(n), err
 }
 
