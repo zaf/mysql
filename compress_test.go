@@ -86,34 +86,55 @@ func TestRoundtrip(t *testing.T) {
 		},
 	}
 
-	_, cSend := newRWMockConn(0)
-	cSend.compress = true
-	cSend.compIO = newCompIO(cSend)
-	_, cReceive := newRWMockConn(0)
-	cReceive.compress = true
-	cReceive.compIO = newCompIO(cReceive)
+	_, zstdSend := newRWMockConn(0)
+	zstdSend.cfg.zstdCompress = true
+	zstdSend.cfg.zstdCompressionLevel = 4
+	zstdSend.compIO = newCompIO(zstdSend)
+	_, zstdReceive := newRWMockConn(0)
+	zstdReceive.cfg.zstdCompress = true
+	zstdReceive.cfg.zstdCompressionLevel = 4
+	zstdReceive.compIO = newCompIO(zstdReceive)
 
-	for _, test := range tests {
-		t.Run(test.desc, func(t *testing.T) {
-			cSend.resetSequence()
-			cReceive.resetSequence()
+	_, zlibSend := newRWMockConn(0)
+	zlibSend.cfg.compress = true
+	zlibSend.cfg.zlibCompressionLevel = 4
+	zlibSend.compIO = newCompIO(zlibSend)
+	_, zlibReceive := newRWMockConn(0)
+	zlibReceive.cfg.compress = true
+	zlibReceive.cfg.zlibCompressionLevel = 4
+	zlibReceive.compIO = newCompIO(zlibReceive)
 
-			uncompressed := roundtripHelper(t, cSend, cReceive, test.uncompressed)
-			if len(uncompressed) != len(test.uncompressed) {
-				t.Errorf("uncompressed size is unexpected. expected %d but got %d",
-					len(test.uncompressed), len(uncompressed))
-			}
-			if !bytes.Equal(uncompressed, test.uncompressed) {
-				t.Errorf("roundtrip failed")
-			}
-			if cSend.sequence != cReceive.sequence {
-				t.Errorf("inconsistent sequence number: send=%v recv=%v",
-					cSend.sequence, cReceive.sequence)
-			}
-			if cSend.compressSequence != cReceive.compressSequence {
-				t.Errorf("inconsistent compress sequence number: send=%v recv=%v",
-					cSend.compressSequence, cReceive.compressSequence)
-			}
-		})
+	conns := []struct {
+		comp    string
+		send    *mysqlConn
+		receive *mysqlConn
+	}{
+		{comp: "zstd", send: zstdSend, receive: zstdReceive},
+		{comp: "zlib", send: zlibSend, receive: zlibReceive},
+	}
+
+	for _, c := range conns {
+		for _, test := range tests {
+			t.Run(test.desc, func(t *testing.T) {
+				c.send.resetSequence()
+				c.receive.resetSequence()
+				uncompressed := roundtripHelper(t, c.send, c.receive, test.uncompressed)
+				if len(uncompressed) != len(test.uncompressed) {
+					t.Errorf("%s: uncompressed size is unexpected. expected %d but got %d",
+						c.comp, len(test.uncompressed), len(uncompressed))
+				}
+				if !bytes.Equal(uncompressed, test.uncompressed) {
+					t.Errorf("%s: roundtrip failed", c.comp)
+				}
+				if c.send.sequence != c.receive.sequence {
+					t.Errorf("%s: inconsistent sequence number: send=%v recv=%v",
+						c.comp, c.send.sequence, c.receive.sequence)
+				}
+				if c.send.compressSequence != c.receive.compressSequence {
+					t.Errorf("%s: inconsistent compress sequence number: send=%v recv=%v",
+						c.comp, c.send.compressSequence, c.receive.compressSequence)
+				}
+			})
+		}
 	}
 }

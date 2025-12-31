@@ -179,7 +179,6 @@ func (mc *mysqlConn) cleanup() {
 	if mc.closed.Swap(true) {
 		return
 	}
-
 	// Makes cleanup idempotent
 	close(mc.closech)
 	conn := mc.rawConn
@@ -188,6 +187,9 @@ func (mc *mysqlConn) cleanup() {
 	}
 	if err := conn.Close(); err != nil {
 		mc.log("closing connection:", err)
+	}
+	if mc.compress {
+		mc.compIO.close()
 	}
 	// This function can be called from multiple goroutines.
 	// So we can not mc.clearResult() here.

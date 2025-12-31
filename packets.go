@@ -297,6 +297,9 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 	if cfg.compress {
 		clientCapabilities |= clientCompress
 	}
+	if cfg.zstdCompress {
+		clientCapabilities |= clientZstdCompressionAlgorithm
+	}
 	// To enable TLS / SSL
 	if mc.cfg.TLS != nil {
 		clientCapabilities |= clientSSL
@@ -408,6 +411,10 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 		connAttrsLen := len(mc.connector.encodedAttributes)
 		data = appendLengthEncodedInteger(data, uint64(connAttrsLen))
 		data = append(data, mc.connector.encodedAttributes...)
+	}
+	// zstd compression level
+	if mc.cfg.zstdCompress {
+		data = append(data, byte(mc.cfg.zstdCompressionLevel))
 	}
 
 	// Send Auth packet

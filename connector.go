@@ -169,7 +169,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 
 	// compression is enabled after auth, not right after sending handshake response.
-	if mc.capabilities&clientCompress > 0 {
+	if mc.capabilities&clientCompress > 0 || mc.capabilities&clientZstdCompressionAlgorithm > 0 {
 		mc.compress = true
 		mc.compIO = newCompIO(mc)
 	}

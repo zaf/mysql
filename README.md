@@ -41,11 +41,11 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
   * Secure `LOAD DATA LOCAL INFILE` support with file allowlisting and `io.Reader` support
   * Optional `time.Time` parsing
   * Optional placeholder interpolation
-  * Supports zlib compression.
+  * Supports zlib and zstd compression.
 
 ## Requirements
 
-* Go 1.22 or higher. We aim to support the 3 latest versions of Go.
+* Go 1.23 or higher. We aim to support the 3 latest versions of Go.
 * MySQL (5.7+) and MariaDB (10.5+) are supported.
 * [TiDB](https://github.com/pingcap/tidb) is supported by PingCAP.
   * Do not ask questions about TiDB in our issue tracker or forum.
@@ -280,6 +280,33 @@ Default:        false
 ```
 
 Toggles zlib compression. false by default.
+
+##### `zlibCompressLevel`
+
+```
+Type:           decimal number
+Valid Values:   1-9
+Default:        2
+```
+Sets the zlib compression level on the client side.
+
+##### `zstdCompress`
+
+```
+Type:           bool
+Valid Values:   true, false
+Default:        false
+```
+
+Toggles zstd compression. false by default. Not supported in MySQL < 8.0 and MariaDB
+
+##### `zstdCompressLevel`
+
+```
+Type:           decimal number
+Valid Values:   1-22
+Default:        2
+```
 
 ##### `interpolateParams`
 
