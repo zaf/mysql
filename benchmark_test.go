@@ -46,11 +46,14 @@ func (tb *TB) checkStmt(stmt *sql.Stmt, err error) *sql.Stmt {
 	return stmt
 }
 
-func initDB(b *testing.B, compress bool, queries ...string) *sql.DB {
+func initDB(b *testing.B, compress string, queries ...string) *sql.DB {
 	tb := (*TB)(b)
 	comprStr := ""
-	if compress {
+	if compress == "zlib" {
 		comprStr = "&compress=1"
+	}
+	if compress == "zstd" {
+		comprStr = "&zstdCompress=1"
 	}
 	db := tb.checkDB(sql.Open(driverNameTest, dsn+comprStr))
 	for _, query := range queries {
@@ -64,14 +67,18 @@ func initDB(b *testing.B, compress bool, queries ...string) *sql.DB {
 const concurrencyLevel = 10
 
 func BenchmarkQuery(b *testing.B) {
-	benchmarkQuery(b, false)
+	benchmarkQuery(b, "")
 }
 
-func BenchmarkQueryCompressed(b *testing.B) {
-	benchmarkQuery(b, true)
+func BenchmarkQueryCompressedZlib(b *testing.B) {
+	benchmarkQuery(b, "zlib")
 }
 
-func benchmarkQuery(b *testing.B, compr bool) {
+func BenchmarkQueryCompressedZstdb(b *testing.B) {
+	benchmarkQuery(b, "zstd")
+}
+
+func benchmarkQuery(b *testing.B, compr string) {
 	tb := (*TB)(b)
 	b.ReportAllocs()
 	db := initDB(b, compr,
@@ -281,7 +288,7 @@ func benchmarkQueryContext(b *testing.B, db *sql.DB, p int) {
 }
 
 func BenchmarkQueryContext(b *testing.B) {
-	db := initDB(b, false,
+	db := initDB(b, "",
 		"DROP TABLE IF EXISTS foo",
 		"CREATE TABLE foo (id INT PRIMARY KEY, val CHAR(50))",
 		`INSERT INTO foo VALUES (1, "one")`,
@@ -317,7 +324,7 @@ func benchmarkExecContext(b *testing.B, db *sql.DB, p int) {
 }
 
 func BenchmarkExecContext(b *testing.B) {
-	db := initDB(b, false,
+	db := initDB(b, "",
 		"DROP TABLE IF EXISTS foo",
 		"CREATE TABLE foo (id INT PRIMARY KEY, val CHAR(50))",
 		`INSERT INTO foo VALUES (1, "one")`,
@@ -335,7 +342,7 @@ func BenchmarkExecContext(b *testing.B) {
 // "size=" means size of each blobs.
 func BenchmarkQueryRawBytes(b *testing.B) {
 	var sizes []int = []int{100, 1000, 2000, 4000, 8000, 12000, 16000, 32000, 64000, 256000}
-	db := initDB(b, false,
+	db := initDB(b, "",
 		"DROP TABLE IF EXISTS bench_rawbytes",
 		"CREATE TABLE bench_rawbytes (id INT PRIMARY KEY, val LONGBLOB)",
 	)
@@ -385,7 +392,7 @@ func BenchmarkQueryRawBytes(b *testing.B) {
 	}
 }
 
-func benchmark10kRows(b *testing.B, compress bool) {
+func benchmark10kRows(b *testing.B, compress string) {
 	// Setup -- prepare 10000 rows.
 	db := initDB(b, compress,
 		"DROP TABLE IF EXISTS foo",
@@ -449,11 +456,15 @@ func benchmark10kRows(b *testing.B, compress bool) {
 
 // BenchmarkReceive10kRows measures performance of receiving large number of rows.
 func BenchmarkReceive10kRows(b *testing.B) {
-	benchmark10kRows(b, false)
+	benchmark10kRows(b, "")
 }
 
-func BenchmarkReceive10kRowsCompressed(b *testing.B) {
-	benchmark10kRows(b, true)
+func BenchmarkReceive10kRowsCompressedZlib(b *testing.B) {
+	benchmark10kRows(b, "zlib")
+}
+
+func BenchmarkReceive10kRowsCompressedZstd(b *testing.B) {
+	benchmark10kRows(b, "zstd")
 }
 
 // BenchmarkReceiveMetadata measures performance of receiving lots of metadata compare to data in rows
@@ -471,7 +482,7 @@ func BenchmarkReceiveMetadata(b *testing.B) {
 	createTableQuery += ")"
 
 	// Initialize database
-	db := initDB(b, false,
+	db := initDB(b, "",
 		"DROP TABLE IF EXISTS large_integer_table",
 		createTableQuery,
 		"INSERT INTO large_integer_table VALUES ("+
