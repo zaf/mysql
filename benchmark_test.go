@@ -74,7 +74,7 @@ func BenchmarkQueryCompressedZlib(b *testing.B) {
 	benchmarkQuery(b, "zlib")
 }
 
-func BenchmarkQueryCompressedZstdb(b *testing.B) {
+func BenchmarkQueryCompressedZstd(b *testing.B) {
 	benchmarkQuery(b, "zstd")
 }
 
