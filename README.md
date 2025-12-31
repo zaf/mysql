@@ -41,7 +41,7 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
   * Secure `LOAD DATA LOCAL INFILE` support with file allowlisting and `io.Reader` support
   * Optional `time.Time` parsing
   * Optional placeholder interpolation
-  * Supports zlib compression.
+  * Supports zlib and zstd compression.
 
 ## Requirements
 
@@ -281,11 +281,29 @@ Default:        false
 
 Toggles zlib compression. false by default.
 
-##### `compressLevel`
+##### `zlibCompressLevel`
 
 ```
 Type:           decimal number
 Valid Values:   1-9
+Default:        2
+```
+
+##### `zstdCompress`
+
+```
+Type:           bool
+Valid Values:   true, false
+Default:        false
+```
+
+Toggles zstd compression. false by default.
+
+##### `zstdCompressLevel`
+
+```
+Type:           decimal number
+Valid Values:   1-22
 Default:        2
 ```
 

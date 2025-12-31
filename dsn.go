@@ -77,8 +77,10 @@ type Config struct {
 	// unexported fields. new options should be come here.
 	// boolean first. alphabetical order.
 
-	compress      bool // Enable zlib compression
-	compressLevel int  // Compression level
+	compress             bool // Enable zlib compression
+	zstdCompress         bool // Enable zstd compression
+	zlibCompressionLevel int  // zlib Compression level
+	zstdCompressionLevel int  // zstd Compression level
 
 	beforeConnect func(context.Context, *Config) error // Invoked before a connection is established
 	pubKey        *rsa.PublicKey                       // Server public key
@@ -98,7 +100,8 @@ func NewConfig() *Config {
 		Logger:               defaultLogger,
 		AllowNativePasswords: true,
 		CheckConnLiveness:    true,
-		compressLevel:        defaultCompressionLevel,
+		zlibCompressionLevel: defaultCompressionLevel,
+		zstdCompressionLevel: defaultCompressionLevel,
 	}
 	return cfg
 }
@@ -132,12 +135,17 @@ func BeforeConnect(fn func(context.Context, *Config) error) Option {
 }
 
 // EnableCompress sets the compression mode and level.
-func EnableCompression(yes bool, level int) Option {
+func EnableCompression(zlib, zstd bool, zlibLevel, zstdLevel int) Option {
 	return func(cfg *Config) error {
-		cfg.compress = yes
-		cfg.compressLevel = defaultCompressionLevel
-		if level > 0 {
-			cfg.compressLevel = level
+		cfg.compress = zlib
+		cfg.zlibCompressionLevel = defaultCompressionLevel
+		if zlibLevel > 0 {
+			cfg.zlibCompressionLevel = zlibLevel
+		}
+		cfg.zstdCompress = zstd
+		cfg.zstdCompressionLevel = defaultCompressionLevel
+		if zstdLevel > 0 {
+			cfg.zstdCompressionLevel = zstdLevel
 		}
 		return nil
 	}
@@ -338,8 +346,16 @@ func (cfg *Config) FormatDSN() string {
 		writeDSNParam(&buf, &hasParam, "compress", "true")
 	}
 
-	if cfg.compressLevel != defaultCompressionLevel {
-		writeDSNParam(&buf, &hasParam, "compressLevel", strconv.Itoa(cfg.compressLevel))
+	if cfg.zlibCompressionLevel != defaultCompressionLevel {
+		writeDSNParam(&buf, &hasParam, "zlibCompressLevel", strconv.Itoa(cfg.zlibCompressionLevel))
+	}
+
+	if cfg.zstdCompress {
+		writeDSNParam(&buf, &hasParam, "zstdCompress", "true")
+	}
+
+	if cfg.zstdCompressionLevel != defaultCompressionLevel {
+		writeDSNParam(&buf, &hasParam, "zstdCompressLevel", strconv.Itoa(cfg.zstdCompressionLevel))
 	}
 
 	if cfg.InterpolateParams {
@@ -568,20 +584,37 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 				return errors.New("invalid bool value: " + value)
 			}
 
-		// Compression
+		// zlib Compression
 		case "compress":
 			var isBool bool
 			cfg.compress, isBool = readBool(value)
 			if !isBool {
 				return errors.New("invalid bool value: " + value)
 			}
-		// Compression level
-		case "compressLevel":
-			cfg.compressLevel, err = strconv.Atoi(value)
+		// zlib Compression level
+		case "zlibCompressLevel":
+			cfg.zlibCompressionLevel, err = strconv.Atoi(value)
 			if err != nil {
 				return
 			}
-			if cfg.compressLevel < 0 || cfg.compressLevel > 9 {
+			if cfg.zlibCompressionLevel < 0 || cfg.zlibCompressionLevel > 9 {
+				return errors.New("invalid compress level: " + value)
+			}
+
+		// zstd Compression
+		case "zstdCompress":
+			var isBool bool
+			cfg.zstdCompress, isBool = readBool(value)
+			if !isBool {
+				return errors.New("invalid bool value: " + value)
+			}
+		// zstd Compression level
+		case "zstdCompressLevel":
+			cfg.zstdCompressionLevel, err = strconv.Atoi(value)
+			if err != nil {
+				return
+			}
+			if cfg.zstdCompressionLevel < 0 || cfg.zstdCompressionLevel > 22 {
 				return errors.New("invalid compress level: " + value)
 			}
 
