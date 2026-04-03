@@ -38,6 +38,14 @@ var (
 	zlibPool     *compIOZlibPool
 	zstdPool     *compIOZstdPool
 	blankHeader  = [compHeaderSize]byte{}
+
+	// Shared codec pools: encoders/decoders are borrowed per-operation
+	// rather than held per-connection, reducing memory when many
+	// connections are open simultaneously.
+	zlibWriterPools  [zlib.BestCompression + 1]sync.Pool
+	zlibReaderPool   sync.Pool
+	zstdEncoderPools [zstd.SpeedBestCompression + 1]sync.Pool
+	zstdDecoderPool  sync.Pool
 )
 
 // compHeader holds the data of a MySQL compressed packet header
@@ -65,22 +73,41 @@ type compressor interface {
 	uncompress(src []byte, dst io.ReaderFrom) (int, error)
 }
 
-// zlibCompressor implements the compressor interface using zlib
+// poolResetter interface for compressors that need cleanup on pool return.
+type poolResetter interface {
+	resetForPool(maxSize int)
+}
+
+// zlibCompressor implements the compressor interface using zlib.
+// The heavy zlib.Writer and zlib.Reader are lazily acquired from shared
+// pools on first use and released back between queries via resetForPool.
 type zlibCompressor struct {
-	writer     *zlib.Writer
-	reader     io.ReadCloser
+	level      int
+	writer     *zlib.Writer  // nil when idle; acquired on first compress
+	reader     io.ReadCloser // nil when idle; acquired on first uncompress
 	buffReader *bytes.Reader
 }
 
 func (zl *zlibCompressor) compress(src []byte, dst io.Writer) error {
-	var err error
-	zl.writer.Reset(dst)
+	if zl.writer == nil {
+		w, ok := zlibWriterPools[zl.level].Get().(*zlib.Writer)
+		if !ok {
+			var err error
+			w, err = zlib.NewWriterLevel(dst, zl.level)
+			if err != nil {
+				return err
+			}
+		} else {
+			w.Reset(dst)
+		}
+		zl.writer = w
+	} else {
+		zl.writer.Reset(dst)
+	}
 	if _, err := zl.writer.Write(src); err != nil {
 		return err
 	}
-	err = zl.writer.Close()
-	return err
-
+	return zl.writer.Close()
 }
 
 func (zl *zlibCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error) {
@@ -89,21 +116,40 @@ func (zl *zlibCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 	} else {
 		zl.buffReader.Reset(src)
 	}
-	var err error
 	if zl.reader == nil {
-		zl.reader, err = zlib.NewReader(zl.buffReader)
-		if err != nil {
-			return 0, err
+		r, ok := zlibReaderPool.Get().(io.ReadCloser)
+		if ok {
+			if err := r.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
+				zlibReaderPool.Put(r)
+				return 0, err
+			}
+		} else {
+			var err error
+			r, err = zlib.NewReader(zl.buffReader)
+			if err != nil {
+				return 0, err
+			}
 		}
+		zl.reader = r
 	} else {
-		err = zl.reader.(zlib.Resetter).Reset(zl.buffReader, nil)
-		if err != nil {
+		if err := zl.reader.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
 			return 0, err
 		}
 	}
 	n, _ := dst.ReadFrom(zl.reader) // ignore err because reader.Close() will return it again.
-	err = zl.reader.Close()         // reader.Close() may return checksum error.
+	err := zl.reader.Close()        // reader.Close() may return checksum error.
 	return int(n), err
+}
+
+func (zl *zlibCompressor) resetForPool(maxSize int) {
+	if zl.writer != nil {
+		zlibWriterPools[zl.level].Put(zl.writer)
+		zl.writer = nil
+	}
+	if zl.reader != nil {
+		zlibReaderPool.Put(zl.reader)
+		zl.reader = nil
+	}
 }
 
 func newZlibPool() *compIOZlibPool {
@@ -111,65 +157,98 @@ func newZlibPool() *compIOZlibPool {
 	for i := range p.pools {
 		level := i
 		p.pools[i].New = func() any {
-			c := &compIO{}
-			c.buff = bytes.Buffer{}
-			c.mc = nil
-			writer, err := zlib.NewWriterLevel(&c.buff, level)
-			if err != nil {
-				panic(err)
+			return &compIO{
+				comp: &zlibCompressor{level: level},
 			}
-			c.comp = &zlibCompressor{writer: writer, reader: nil}
-			return c
 		}
 	}
 	return p
 }
 
-// zstdCompressor implements the compressor interface using zstd
+// zstdCompressor implements the compressor interface using zstd.
+// The heavy zstd.Encoder and zstd.Decoder are lazily acquired from shared
+// pools on first use and released back between queries via resetForPool.
 type zstdCompressor struct {
-	writer     *zstd.Encoder
-	reader     io.Reader
+	level      zstd.EncoderLevel
+	encoder    *zstd.Encoder // nil when idle; acquired on first compress
+	decoder    *zstd.Decoder // nil when idle; acquired on first uncompress
+	scratch    []byte
 	buffReader *bytes.Reader
 }
 
-func (zs *zstdCompressor) compress(src []byte, dst io.Writer) error {
-	var err error
-	zs.writer.Reset(dst)
-	if _, err := zs.writer.Write(src); err != nil {
-		return err
+func (zs *zstdCompressor) resetForPool(maxSize int) {
+	if cap(zs.scratch) > maxSize {
+		zs.scratch = nil
 	}
-	err = zs.writer.Close()
+	if zs.encoder != nil {
+		zstdEncoderPools[zs.level].Put(zs.encoder)
+		zs.encoder = nil
+	}
+	if zs.decoder != nil {
+		zstdDecoderPool.Put(zs.decoder)
+		zs.decoder = nil
+	}
+}
+
+func (zs *zstdCompressor) compress(src []byte, dst io.Writer) error {
+	if zs.encoder == nil {
+		enc, ok := zstdEncoderPools[zs.level].Get().(*zstd.Encoder)
+		if !ok {
+			enc = newZstdEncoder(zs.level)
+		}
+		zs.encoder = enc
+	}
+	compressed := zs.encoder.EncodeAll(src, zs.scratch[:0])
+	zs.scratch = compressed // reuse backing array on next call
+	_, err := dst.Write(compressed)
 	return err
 }
 
 func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error) {
-	if zs.buffReader == nil {
-		zs.buffReader = bytes.NewReader(src)
-	} else {
-		zs.buffReader.Reset(src)
-	}
-	var err error
-	if zs.reader == nil {
-		zs.reader, err = zstd.NewReader(zs.buffReader,
-			zstd.WithDecoderLowmem(true),
-			zstd.WithDecoderConcurrency(1),
-			zstd.WithDecoderMaxMemory(16<<20), // 16MB
-		)
-		if err != nil {
-			return 0, err
+	if zs.decoder == nil {
+		dec, ok := zstdDecoderPool.Get().(*zstd.Decoder)
+		if !ok {
+			dec = newZstdDecoder()
 		}
-	} else {
-		err = zs.reader.(*zstd.Decoder).Reset(zs.buffReader)
-		if err != nil {
-			return 0, err
-		}
+		zs.decoder = dec
 	}
-	n, err := dst.ReadFrom(zs.reader)
+	decoded, err := zs.decoder.DecodeAll(src, zs.scratch[:0])
 	if err != nil {
 		return 0, err
 	}
-	err = zs.reader.(*zstd.Decoder).Reset(nil)
+	zs.scratch = decoded // reuse backing array on next call
+	if zs.buffReader == nil {
+		zs.buffReader = bytes.NewReader(decoded)
+	} else {
+		zs.buffReader.Reset(decoded)
+	}
+	n, err := dst.ReadFrom(zs.buffReader)
 	return int(n), err
+}
+
+func newZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(level),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithWindowSize(1<<18), // 256KB
+	)
+	if err != nil {
+		panic(err)
+	}
+	return enc
+}
+
+func newZstdDecoder() *zstd.Decoder {
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderMaxMemory(16<<20), // 16MB
+	)
+	if err != nil {
+		panic(err)
+	}
+	return dec
 }
 
 func newZstdPool() *compIOZstdPool {
@@ -177,20 +256,9 @@ func newZstdPool() *compIOZstdPool {
 	for i := range p.pools {
 		level := i
 		p.pools[i].New = func() any {
-			c := &compIO{}
-			c.buff = bytes.Buffer{}
-			c.mc = nil
-			writer, err := zstd.NewWriter(&c.buff,
-				zstd.WithEncoderLevel(zstd.EncoderLevel(level)),
-				zstd.WithLowerEncoderMem(true),
-				zstd.WithEncoderConcurrency(1),
-				zstd.WithWindowSize(1<<18), // 256KB
-			)
-			if err != nil {
-				panic(err)
+			return &compIO{
+				comp: &zstdCompressor{level: zstd.EncoderLevel(level)},
 			}
-			c.comp = &zstdCompressor{writer: writer, reader: nil}
-			return c
 		}
 	}
 	return p
@@ -240,7 +308,7 @@ func (c *compIO) close() {
 	zlibPool.pools[level].Put(c)
 }
 
-const maxPoolBufferSize = 1 << 19 // 512KB
+const maxPoolBufferSize = 1 << 16 // 64KB
 
 func (c *compIO) reset() {
 	// Reset large buffers to avoid memory bloat in the pool
@@ -248,6 +316,9 @@ func (c *compIO) reset() {
 		c.buff = bytes.Buffer{}
 	} else {
 		c.buff.Reset()
+	}
+	if pr, ok := c.comp.(poolResetter); ok {
+		pr.resetForPool(maxPoolBufferSize)
 	}
 }
 
@@ -269,11 +340,11 @@ func (c *compIO) readCompressedPacket() error {
 	_ = header[6] // bounds check hint to compiler; guaranteed by readNext
 
 	// Read compressed header data
-	h := &compHeader{}
+	var h compHeader
 	h.read(header)
 	if debug {
 		fmt.Printf("uncompress cmplen=%v uncomplen=%v pkt_cmp_seq=%v expected_cmp_seq=%v\n",
-			h.CompressedLength, h.UncompressedLength, h.Sequence, c.mc.sequence)
+			h.CompressedLength, h.UncompressedLength, h.Sequence, c.mc.compressSequence)
 	}
 	// Do not return ErrPktSync here.
 	// Server may return error packet (e.g. 1153 Got a packet bigger than 'max_allowed_packet' bytes)
@@ -334,11 +405,12 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 			header.UncompressedLength = 0
 		} else {
 			err := c.comp.compress(payload, buf)
-			if debug && err != nil {
-				fmt.Printf("compress error: %v", err)
+			if err != nil {
+				c.mc.log("compress error:", err)
 			}
-			// do not compress if compressed data is larger than uncompressed data
-			// I intentionally miss 7 byte header in the buf; compress must compress more than 7 bytes.
+			// do not compress if compressed data is larger than uncompressed data.
+			// The 7-byte header in buf is intentionally excluded from the comparison;
+			// compression must save more than the header overhead to be worthwhile.
 			if err != nil || buf.Len() >= int(header.UncompressedLength) {
 				buf.Reset()
 				buf.Write(blankHeader[:])

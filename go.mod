@@ -1,7 +1,7 @@
 module github.com/zaf/mysql
 
-go 1.23
+go 1.24
 
-require filippo.io/edwards25519 v1.1.0
+require filippo.io/edwards25519 v1.1.1
 
-require github.com/klauspost/compress v1.18.2
+require github.com/klauspost/compress v1.18.5

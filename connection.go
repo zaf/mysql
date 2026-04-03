@@ -725,7 +725,15 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 // IsValid implements driver.Validator interface
 // (From Go 1.15)
 func (mc *mysqlConn) IsValid() bool {
-	return !mc.closed.Load() && !mc.buf.busy()
+	if mc.closed.Load() || mc.buf.busy() {
+		return false
+	}
+	// Release compression codecs while idle in the pool.
+	// They will be lazily re-acquired on the next query.
+	if mc.compress {
+		mc.compIO.reset()
+	}
+	return true
 }
 
 var _ driver.SessionResetter = &mysqlConn{}
