@@ -22,26 +22,10 @@ const (
 	compHeaderSize = 7
 )
 
-// compIOZlibPool is a bucket of compIO pools using zlib compression, one for each compression level
-type compIOZlibPool struct {
-	pools [zlib.BestCompression + 1]sync.Pool
-}
-
-// compIOZstdPool is a bucket of compIO pools using zstd compression, one for each compression level
-type compIOZstdPool struct {
-	pools [zstd.SpeedBestCompression + 1]sync.Pool
-}
-
 var (
-	initzlibPool sync.Once
-	initzstdPool sync.Once
-	zlibPool     *compIOZlibPool
-	zstdPool     *compIOZstdPool
-	blankHeader  = [compHeaderSize]byte{}
+	blankHeader = [compHeaderSize]byte{}
 
 	// Shared codec pools: encoders/decoders are borrowed per-operation
-	// rather than held per-connection, reducing memory when many
-	// connections are open simultaneously.
 	zlibWriterPools  [zlib.BestCompression + 1]sync.Pool
 	zlibReaderPool   sync.Pool
 	zstdEncoderPools [zstd.SpeedBestCompression + 1]sync.Pool
@@ -71,16 +55,16 @@ func (h *compHeader) write(data []byte) {
 type compressor interface {
 	compress(src []byte, dst io.Writer) error
 	uncompress(src []byte, dst io.ReaderFrom) (int, error)
-}
 
-// poolResetter interface for compressors that need cleanup on pool return.
-type poolResetter interface {
-	resetForPool(maxSize int)
+	// releaseCodecs returns heavy encoder/decoder objects to shared pools
+	// and trims oversized scratch buffers. Called when the connection
+	// goes idle or is closed.
+	releaseCodecs()
 }
 
 // zlibCompressor implements the compressor interface using zlib.
 // The heavy zlib.Writer and zlib.Reader are lazily acquired from shared
-// pools on first use and released back between queries via resetForPool.
+// pools on first use and released back between queries via releaseCodecs.
 type zlibCompressor struct {
 	level      int
 	writer     *zlib.Writer  // nil when idle; acquired on first compress
@@ -141,7 +125,7 @@ func (zl *zlibCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 	return int(n), err
 }
 
-func (zl *zlibCompressor) resetForPool(maxSize int) {
+func (zl *zlibCompressor) releaseCodecs() {
 	if zl.writer != nil {
 		zlibWriterPools[zl.level].Put(zl.writer)
 		zl.writer = nil
@@ -152,22 +136,9 @@ func (zl *zlibCompressor) resetForPool(maxSize int) {
 	}
 }
 
-func newZlibPool() *compIOZlibPool {
-	p := &compIOZlibPool{}
-	for i := range p.pools {
-		level := i
-		p.pools[i].New = func() any {
-			return &compIO{
-				comp: &zlibCompressor{level: level},
-			}
-		}
-	}
-	return p
-}
-
 // zstdCompressor implements the compressor interface using zstd.
 // The heavy zstd.Encoder and zstd.Decoder are lazily acquired from shared
-// pools on first use and released back between queries via resetForPool.
+// pools on first use and released back between queries via releaseCodecs.
 type zstdCompressor struct {
 	level      zstd.EncoderLevel
 	encoder    *zstd.Encoder // nil when idle; acquired on first compress
@@ -176,8 +147,8 @@ type zstdCompressor struct {
 	buffReader *bytes.Reader
 }
 
-func (zs *zstdCompressor) resetForPool(maxSize int) {
-	if cap(zs.scratch) > maxSize {
+func (zs *zstdCompressor) releaseCodecs() {
+	if cap(zs.scratch) > maxIdleBufferSize {
 		zs.scratch = nil
 	}
 	if zs.encoder != nil {
@@ -251,19 +222,6 @@ func newZstdDecoder() *zstd.Decoder {
 	return dec
 }
 
-func newZstdPool() *compIOZstdPool {
-	p := &compIOZstdPool{}
-	for i := range p.pools {
-		level := i
-		p.pools[i].New = func() any {
-			return &compIO{
-				comp: &zstdCompressor{level: zstd.EncoderLevel(level)},
-			}
-		}
-	}
-	return p
-}
-
 type compIO struct {
 	buff bytes.Buffer
 	mc   *mysqlConn
@@ -271,55 +229,31 @@ type compIO struct {
 }
 
 func newCompIO(mc *mysqlConn) *compIO {
+	c := &compIO{mc: mc}
 	if mc.cfg.zstdCompress {
-		initzstdPool.Do(func() {
-			zstdPool = newZstdPool()
-		})
 		level := zstd.EncoderLevelFromZstd(mc.cfg.zstdCompressionLevel)
-		c, ok := zstdPool.pools[level].Get().(*compIO)
-		if !ok {
-			panic(fmt.Sprintf("unexpected zstdPool type %T", c))
-		}
-		c.mc = mc
-		return c
+		c.comp = &zstdCompressor{level: level}
+	} else {
+		c.comp = &zlibCompressor{level: mc.cfg.zlibCompressionLevel}
 	}
-	initzlibPool.Do(func() {
-		zlibPool = newZlibPool()
-	})
-	c, ok := zlibPool.pools[mc.cfg.zlibCompressionLevel].Get().(*compIO)
-	if !ok {
-		panic(fmt.Sprintf("unexpected zlibPool type %T", c))
-	}
-	c.mc = mc
 	return c
 }
 
 func (c *compIO) close() {
-	if c.mc.cfg.zstdCompress {
-		level := zstd.EncoderLevelFromZstd(c.mc.cfg.zstdCompressionLevel)
-		c.mc = nil
-		c.reset()
-		zstdPool.pools[level].Put(c)
-		return
-	}
-	level := c.mc.cfg.zlibCompressionLevel
+	c.comp.releaseCodecs()
 	c.mc = nil
-	c.reset()
-	zlibPool.pools[level].Put(c)
 }
 
-const maxPoolBufferSize = 1 << 16 // 64KB
+const maxIdleBufferSize = 1 << 16 // 64KB
 
 func (c *compIO) reset() {
-	// Reset large buffers to avoid memory bloat in the pool
-	if c.buff.Cap() > maxPoolBufferSize {
+	// Release large buffers to reduce memory when idle.
+	if c.buff.Cap() > maxIdleBufferSize {
 		c.buff = bytes.Buffer{}
 	} else {
 		c.buff.Reset()
 	}
-	if pr, ok := c.comp.(poolResetter); ok {
-		pr.resetForPool(maxPoolBufferSize)
-	}
+	c.comp.releaseCodecs()
 }
 
 func (c *compIO) readNext(need int) ([]byte, error) {

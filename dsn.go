@@ -140,11 +140,17 @@ func EnableCompression(zlib, zstd bool, zlibLevel, zstdLevel int) Option {
 		cfg.compress = zlib
 		cfg.zlibCompressionLevel = defaultCompressionLevel
 		if zlibLevel > 0 {
+			if zlibLevel > 9 {
+				return errors.New("invalid zlib compress level")
+			}
 			cfg.zlibCompressionLevel = zlibLevel
 		}
 		cfg.zstdCompress = zstd
 		cfg.zstdCompressionLevel = defaultCompressionLevel
 		if zstdLevel > 0 {
+			if zstdLevel > 22 {
+				return errors.New("invalid zstd compress level")
+			}
 			cfg.zstdCompressionLevel = zstdLevel
 		}
 		return nil
