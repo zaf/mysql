@@ -728,8 +728,6 @@ func (mc *mysqlConn) IsValid() bool {
 	if mc.closed.Load() || mc.buf.busy() {
 		return false
 	}
-	// Release compression codecs while idle in the pool.
-	// They will be lazily re-acquired on the next query.
 	if mc.compress {
 		mc.compIO.reset()
 	}

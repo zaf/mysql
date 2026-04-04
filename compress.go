@@ -55,10 +55,8 @@ func (h *compHeader) write(data []byte) {
 type compressor interface {
 	compress(src []byte, dst io.Writer) error
 	uncompress(src []byte, dst io.ReaderFrom) (int, error)
-
 	// releaseCodecs returns heavy encoder/decoder objects to shared pools
-	// and trims oversized scratch buffers. Called when the connection
-	// goes idle or is closed.
+	// and trims oversized scratch buffers. Called when the connection is closed.
 	releaseCodecs()
 }
 
@@ -147,20 +145,6 @@ type zstdCompressor struct {
 	buffReader *bytes.Reader
 }
 
-func (zs *zstdCompressor) releaseCodecs() {
-	if cap(zs.scratch) > maxIdleBufferSize {
-		zs.scratch = nil
-	}
-	if zs.encoder != nil {
-		zstdEncoderPools[zs.level].Put(zs.encoder)
-		zs.encoder = nil
-	}
-	if zs.decoder != nil {
-		zstdDecoderPool.Put(zs.decoder)
-		zs.decoder = nil
-	}
-}
-
 func (zs *zstdCompressor) compress(src []byte, dst io.Writer) error {
 	if zs.encoder == nil {
 		enc, ok := zstdEncoderPools[zs.level].Get().(*zstd.Encoder)
@@ -195,6 +179,20 @@ func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error)
 	}
 	n, err := dst.ReadFrom(zs.buffReader)
 	return int(n), err
+}
+
+func (zs *zstdCompressor) releaseCodecs() {
+	if cap(zs.scratch) > maxIdleBufferSize {
+		zs.scratch = nil
+	}
+	if zs.encoder != nil {
+		zstdEncoderPools[zs.level].Put(zs.encoder)
+		zs.encoder = nil
+	}
+	if zs.decoder != nil {
+		zstdDecoderPool.Put(zs.decoder)
+		zs.decoder = nil
+	}
 }
 
 func newZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
@@ -253,7 +251,7 @@ func (c *compIO) reset() {
 	} else {
 		c.buff.Reset()
 	}
-	c.comp.releaseCodecs()
+	//c.comp.releaseCodecs()
 }
 
 func (c *compIO) readNext(need int) ([]byte, error) {
@@ -325,7 +323,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 	buf := &c.buff
 
 	for len(packets) > 0 {
-		header := &compHeader{}
+		var header compHeader
 		payloadLen := min(maxPayloadLen, len(packets))
 		payload := packets[:payloadLen]
 		header.UncompressedLength = uint32(payloadLen)
@@ -355,7 +353,7 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 		header.CompressedLength = uint32(buf.Len() - compHeaderSize)
 		header.Sequence = c.mc.compressSequence
 
-		if n, err := c.writeCompressedPacket(header); err != nil {
+		if n, err := c.writeCompressedPacket(&header); err != nil {
 			// To allow returning ErrBadConn when sending really 0 bytes, we sum
 			// up compressed bytes that is returned by underlying Write().
 			return totalBytes - len(packets) + n, err
