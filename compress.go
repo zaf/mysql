@@ -26,10 +26,19 @@ var (
 	blankHeader = [compHeaderSize]byte{}
 
 	// Shared codec pools: encoders/decoders are borrowed per-operation
-	zlibWriterPools  [zlib.BestCompression + 1]sync.Pool
-	zlibReaderPool   sync.Pool
-	zstdEncoderPools [zstd.SpeedBestCompression + 1]sync.Pool
-	zstdDecoderPool  sync.Pool
+	zlibWriterPools [zlib.BestCompression + 1]sync.Pool
+	zlibReaderPool  sync.Pool
+
+	// zstd uses shared singletons instead of pools because EncodeAll/DecodeAll
+	// are concurrency-safe.
+	zstdEncoders [zstd.SpeedBestCompression + 1]struct {
+		once sync.Once
+		enc  *zstd.Encoder
+	}
+	zstdDecoder struct {
+		once sync.Once
+		dec  *zstd.Decoder
+	}
 )
 
 // compHeader holds the data of a MySQL compressed packet header
@@ -51,155 +60,120 @@ func (h *compHeader) write(data []byte) {
 	putUint24(data[4:7], int(h.UncompressedLength))
 }
 
-// compressor interface
+// compressor defines the compression/decompression operations used by compIO.
 type compressor interface {
-	compress(src []byte, dst io.Writer) error
-	uncompress(src []byte, dst io.ReaderFrom) (int, error)
-	// releaseCodecs returns heavy encoder/decoder objects to shared pools
-	// and trims oversized scratch buffers. Called when the connection is closed.
-	releaseCodecs()
+	compress(src []byte, dst *bytes.Buffer) error
+	uncompress(src []byte, dst *bytes.Buffer) (int, error)
+	cleanup()
 }
 
 // zlibCompressor implements the compressor interface using zlib.
-// The heavy zlib.Writer and zlib.Reader are lazily acquired from shared
-// pools on first use and released back between queries via releaseCodecs.
+// Writers and readers are borrowed from shared pools per-operation and
+// returned immediately after each compress/uncompress call.
 type zlibCompressor struct {
 	level      int
-	writer     *zlib.Writer  // nil when idle; acquired on first compress
-	reader     io.ReadCloser // nil when idle; acquired on first uncompress
 	buffReader *bytes.Reader
 }
 
-func (zl *zlibCompressor) compress(src []byte, dst io.Writer) error {
-	if zl.writer == nil {
-		w, ok := zlibWriterPools[zl.level].Get().(*zlib.Writer)
-		if !ok {
-			var err error
-			w, err = zlib.NewWriterLevel(dst, zl.level)
-			if err != nil {
-				return err
-			}
-		} else {
-			w.Reset(dst)
+func (zl *zlibCompressor) compress(src []byte, dst *bytes.Buffer) error {
+	w, ok := zlibWriterPools[zl.level].Get().(*zlib.Writer)
+	if !ok {
+		var err error
+		w, err = zlib.NewWriterLevel(dst, zl.level)
+		if err != nil {
+			return err
 		}
-		zl.writer = w
 	} else {
-		zl.writer.Reset(dst)
+		w.Reset(dst)
 	}
-	if _, err := zl.writer.Write(src); err != nil {
+	if _, err := w.Write(src); err != nil {
+		zlibWriterPools[zl.level].Put(w)
 		return err
 	}
-	return zl.writer.Close()
+	err := w.Close()
+	zlibWriterPools[zl.level].Put(w)
+	return err
 }
 
-func (zl *zlibCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error) {
+func (zl *zlibCompressor) uncompress(src []byte, dst *bytes.Buffer) (int, error) {
 	if zl.buffReader == nil {
 		zl.buffReader = bytes.NewReader(src)
 	} else {
 		zl.buffReader.Reset(src)
 	}
-	if zl.reader == nil {
-		r, ok := zlibReaderPool.Get().(io.ReadCloser)
-		if ok {
-			if err := r.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
-				zlibReaderPool.Put(r)
-				return 0, err
-			}
-		} else {
-			var err error
-			r, err = zlib.NewReader(zl.buffReader)
-			if err != nil {
-				return 0, err
-			}
+	r, ok := zlibReaderPool.Get().(io.ReadCloser)
+	if ok {
+		if err := r.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
+			zlibReaderPool.Put(r)
+			return 0, err
 		}
-		zl.reader = r
 	} else {
-		if err := zl.reader.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
+		var err error
+		r, err = zlib.NewReader(zl.buffReader)
+		if err != nil {
 			return 0, err
 		}
 	}
-	n, _ := dst.ReadFrom(zl.reader) // ignore err because reader.Close() will return it again.
-	err := zl.reader.Close()        // reader.Close() may return checksum error.
+	n, _ := dst.ReadFrom(r) // ignore err because r.Close() will return it again.
+	err := r.Close()        // r.Close() may return checksum error.
+	zlibReaderPool.Put(r)
 	return int(n), err
 }
 
-func (zl *zlibCompressor) releaseCodecs() {
-	if zl.writer != nil {
-		zlibWriterPools[zl.level].Put(zl.writer)
-		zl.writer = nil
-	}
-	if zl.reader != nil {
-		zlibReaderPool.Put(zl.reader)
-		zl.reader = nil
-	}
+func (zl *zlibCompressor) cleanup() {
+	// Writers and readers are returned to pools per-operation; nothing to do.
 }
 
 // zstdCompressor implements the compressor interface using zstd.
-// The heavy zstd.Encoder and zstd.Decoder are lazily acquired from shared
-// pools on first use and released back between queries via releaseCodecs.
+// The encoder and decoder are shared singletons (concurrency-safe via
+// EncodeAll/DecodeAll). Only the scratch buffer is per-connection.
 type zstdCompressor struct {
-	level      zstd.EncoderLevel
-	encoder    *zstd.Encoder // nil when idle; acquired on first compress
-	decoder    *zstd.Decoder // nil when idle; acquired on first uncompress
-	scratch    []byte
-	buffReader *bytes.Reader
+	encoder *zstd.Encoder // shared singleton; do not close
+	decoder *zstd.Decoder // shared singleton; do not close
+	scratch []byte
 }
 
-func (zs *zstdCompressor) compress(src []byte, dst io.Writer) error {
-	if zs.encoder == nil {
-		enc, ok := zstdEncoderPools[zs.level].Get().(*zstd.Encoder)
-		if !ok {
-			enc = newZstdEncoder(zs.level)
-		}
-		zs.encoder = enc
-	}
+func (zs *zstdCompressor) compress(src []byte, dst *bytes.Buffer) error {
 	compressed := zs.encoder.EncodeAll(src, zs.scratch[:0])
-	zs.scratch = compressed // reuse backing array on next call
+	zs.scratch = compressed
 	_, err := dst.Write(compressed)
 	return err
 }
 
-func (zs *zstdCompressor) uncompress(src []byte, dst io.ReaderFrom) (int, error) {
-	if zs.decoder == nil {
-		dec, ok := zstdDecoderPool.Get().(*zstd.Decoder)
-		if !ok {
-			dec = newZstdDecoder()
-		}
-		zs.decoder = dec
-	}
+func (zs *zstdCompressor) uncompress(src []byte, dst *bytes.Buffer) (int, error) {
 	decoded, err := zs.decoder.DecodeAll(src, zs.scratch[:0])
 	if err != nil {
 		return 0, err
 	}
-	zs.scratch = decoded // reuse backing array on next call
-	if zs.buffReader == nil {
-		zs.buffReader = bytes.NewReader(decoded)
-	} else {
-		zs.buffReader.Reset(decoded)
-	}
-	n, err := dst.ReadFrom(zs.buffReader)
-	return int(n), err
+	zs.scratch = decoded
+	n, err := dst.Write(decoded)
+	return n, err
 }
 
-func (zs *zstdCompressor) releaseCodecs() {
+func (zs *zstdCompressor) cleanup() {
 	if cap(zs.scratch) > maxIdleBufferSize {
 		zs.scratch = nil
 	}
-	if zs.encoder != nil {
-		zstdEncoderPools[zs.level].Put(zs.encoder)
-		zs.encoder = nil
-	}
-	if zs.decoder != nil {
-		zstdDecoderPool.Put(zs.decoder)
-		zs.decoder = nil
-	}
+}
+
+func sharedZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
+	zstdEncoders[level].once.Do(func() {
+		zstdEncoders[level].enc = newZstdEncoder(level)
+	})
+	return zstdEncoders[level].enc
+}
+
+func sharedZstdDecoder() *zstd.Decoder {
+	zstdDecoder.once.Do(func() {
+		zstdDecoder.dec = newZstdDecoder()
+	})
+	return zstdDecoder.dec
 }
 
 func newZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
 	enc, err := zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(level),
 		zstd.WithLowerEncoderMem(true),
-		zstd.WithEncoderConcurrency(1),
 		zstd.WithWindowSize(1<<18), // 256KB
 	)
 	if err != nil {
@@ -211,7 +185,6 @@ func newZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
 func newZstdDecoder() *zstd.Decoder {
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecoderLowmem(true),
-		zstd.WithDecoderConcurrency(1),
 		zstd.WithDecoderMaxMemory(16<<20), // 16MB
 	)
 	if err != nil {
@@ -220,6 +193,7 @@ func newZstdDecoder() *zstd.Decoder {
 	return dec
 }
 
+// compIO handles compression/decompression of MySQL packets.
 type compIO struct {
 	buff bytes.Buffer
 	mc   *mysqlConn
@@ -230,7 +204,10 @@ func newCompIO(mc *mysqlConn) *compIO {
 	c := &compIO{mc: mc}
 	if mc.cfg.zstdCompress {
 		level := zstd.EncoderLevelFromZstd(mc.cfg.zstdCompressionLevel)
-		c.comp = &zstdCompressor{level: level}
+		c.comp = &zstdCompressor{
+			encoder: sharedZstdEncoder(level),
+			decoder: sharedZstdDecoder(),
+		}
 	} else {
 		c.comp = &zlibCompressor{level: mc.cfg.zlibCompressionLevel}
 	}
@@ -238,7 +215,7 @@ func newCompIO(mc *mysqlConn) *compIO {
 }
 
 func (c *compIO) close() {
-	c.comp.releaseCodecs()
+	c.comp.cleanup()
 	c.mc = nil
 }
 
@@ -251,7 +228,7 @@ func (c *compIO) reset() {
 	} else {
 		c.buff.Reset()
 	}
-	//c.comp.releaseCodecs()
+	c.comp.cleanup()
 }
 
 func (c *compIO) readNext(need int) ([]byte, error) {
@@ -322,8 +299,8 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 	totalBytes := len(packets)
 	buf := &c.buff
 
+	var header compHeader
 	for len(packets) > 0 {
-		var header compHeader
 		payloadLen := min(maxPayloadLen, len(packets))
 		payload := packets[:payloadLen]
 		header.UncompressedLength = uint32(payloadLen)
