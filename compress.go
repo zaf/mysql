@@ -10,78 +10,225 @@ package mysql
 
 import (
 	"bytes"
-	"compress/zlib"
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/klauspost/compress/zlib"
+	"github.com/klauspost/compress/zstd"
+)
+
+const (
+	compHeaderSize = 7
 )
 
 var (
-	zrPool *sync.Pool // Do not use directly. Use zDecompress() instead.
-	zwPool *sync.Pool // Do not use directly. Use zCompress() instead.
+	blankHeader = [compHeaderSize]byte{}
+
+	// Shared codec pools: encoders/decoders are borrowed per-operation
+	zlibWriterPools [zlib.BestCompression + 1]sync.Pool
+	zlibReaderPool  sync.Pool
+
+	// zstd uses shared singletons instead of pools because EncodeAll/DecodeAll
+	// are concurrency-safe.
+	zstdEncoders [zstd.SpeedBestCompression + 1]struct {
+		once sync.Once
+		enc  *zstd.Encoder
+	}
+	zstdDecoder struct {
+		once sync.Once
+		dec  *zstd.Decoder
+	}
 )
 
-func init() {
-	zrPool = &sync.Pool{
-		New: func() any { return nil },
-	}
-	zwPool = &sync.Pool{
-		New: func() any {
-			zw, err := zlib.NewWriterLevel(new(bytes.Buffer), 2)
-			if err != nil {
-				panic(err) // compress/zlib return non-nil error only if level is invalid
-			}
-			return zw
-		},
-	}
+// compHeader holds the data of a MySQL compressed packet header
+type compHeader struct {
+	CompressedLength   uint32
+	UncompressedLength uint32
+	Sequence           uint8
 }
 
-func zDecompress(src []byte, dst *bytes.Buffer) (int, error) {
-	br := bytes.NewReader(src)
-	var zr io.ReadCloser
-	var err error
+func (h *compHeader) read(data []byte) {
+	h.CompressedLength = uint32(getUint24(data[0:3]))
+	h.Sequence = data[3]
+	h.UncompressedLength = uint32(getUint24(data[4:7]))
+}
 
-	if a := zrPool.Get(); a == nil {
-		if zr, err = zlib.NewReader(br); err != nil {
-			return 0, err
+func (h *compHeader) write(data []byte) {
+	putUint24(data[0:3], int(h.CompressedLength))
+	data[3] = h.Sequence
+	putUint24(data[4:7], int(h.UncompressedLength))
+}
+
+// compressor defines the compression/decompression operations used by compIO.
+type compressor interface {
+	compress(src []byte, dst *bytes.Buffer) error
+	uncompress(src []byte, dst *bytes.Buffer) (int, error)
+	cleanup()
+}
+
+// zlibCompressor implements the compressor interface using zlib.
+// Writers and readers are borrowed from shared pools per-operation and
+// returned immediately after each compress/uncompress call.
+type zlibCompressor struct {
+	level      int
+	buffReader *bytes.Reader
+}
+
+func (zl *zlibCompressor) compress(src []byte, dst *bytes.Buffer) error {
+	w, ok := zlibWriterPools[zl.level].Get().(*zlib.Writer)
+	if !ok {
+		var err error
+		w, err = zlib.NewWriterLevel(dst, zl.level)
+		if err != nil {
+			return err
 		}
 	} else {
-		zr = a.(io.ReadCloser)
-		if err := zr.(zlib.Resetter).Reset(br, nil); err != nil {
-			return 0, err
-		}
+		w.Reset(dst)
 	}
-
-	n, _ := dst.ReadFrom(zr) // ignore err because zr.Close() will return it again.
-	err = zr.Close()         // zr.Close() may return chuecksum error.
-	zrPool.Put(zr)
-	return int(n), err
-}
-
-func zCompress(src []byte, dst io.Writer) error {
-	zw := zwPool.Get().(*zlib.Writer)
-	zw.Reset(dst)
-	if _, err := zw.Write(src); err != nil {
+	if _, err := w.Write(src); err != nil {
+		zlibWriterPools[zl.level].Put(w)
 		return err
 	}
-	err := zw.Close()
-	zwPool.Put(zw)
+	err := w.Close()
+	zlibWriterPools[zl.level].Put(w)
 	return err
 }
 
-type compIO struct {
-	mc   *mysqlConn
-	buff bytes.Buffer
+func (zl *zlibCompressor) uncompress(src []byte, dst *bytes.Buffer) (int, error) {
+	if zl.buffReader == nil {
+		zl.buffReader = bytes.NewReader(src)
+	} else {
+		zl.buffReader.Reset(src)
+	}
+	r, ok := zlibReaderPool.Get().(io.ReadCloser)
+	if ok {
+		if err := r.(zlib.Resetter).Reset(zl.buffReader, nil); err != nil {
+			zlibReaderPool.Put(r)
+			return 0, err
+		}
+	} else {
+		var err error
+		r, err = zlib.NewReader(zl.buffReader)
+		if err != nil {
+			return 0, err
+		}
+	}
+	n, _ := dst.ReadFrom(r) // ignore err because r.Close() will return it again.
+	err := r.Close()        // r.Close() may return checksum error.
+	zlibReaderPool.Put(r)
+	return int(n), err
 }
 
-func newCompIO(mc *mysqlConn) *compIO {
-	return &compIO{
-		mc: mc,
+func (zl *zlibCompressor) cleanup() {
+	// Writers and readers are returned to pools per-operation; nothing to do.
+}
+
+// zstdCompressor implements the compressor interface using zstd.
+// The encoder and decoder are shared singletons (concurrency-safe via
+// EncodeAll/DecodeAll). Only the scratch buffer is per-connection.
+type zstdCompressor struct {
+	encoder *zstd.Encoder // shared singleton; do not close
+	decoder *zstd.Decoder // shared singleton; do not close
+	scratch []byte
+}
+
+func (zs *zstdCompressor) compress(src []byte, dst *bytes.Buffer) error {
+	compressed := zs.encoder.EncodeAll(src, zs.scratch[:0])
+	zs.scratch = compressed
+	_, err := dst.Write(compressed)
+	return err
+}
+
+func (zs *zstdCompressor) uncompress(src []byte, dst *bytes.Buffer) (int, error) {
+	decoded, err := zs.decoder.DecodeAll(src, zs.scratch[:0])
+	if err != nil {
+		return 0, err
+	}
+	zs.scratch = decoded
+	n, err := dst.Write(decoded)
+	return n, err
+}
+
+func (zs *zstdCompressor) cleanup() {
+	if cap(zs.scratch) > maxIdleBufferSize {
+		zs.scratch = nil
 	}
 }
 
+func sharedZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
+	zstdEncoders[level].once.Do(func() {
+		zstdEncoders[level].enc = newZstdEncoder(level)
+	})
+	return zstdEncoders[level].enc
+}
+
+func sharedZstdDecoder() *zstd.Decoder {
+	zstdDecoder.once.Do(func() {
+		zstdDecoder.dec = newZstdDecoder()
+	})
+	return zstdDecoder.dec
+}
+
+func newZstdEncoder(level zstd.EncoderLevel) *zstd.Encoder {
+	enc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(level),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithWindowSize(1<<18), // 256KB
+	)
+	if err != nil {
+		panic(err)
+	}
+	return enc
+}
+
+func newZstdDecoder() *zstd.Decoder {
+	dec, err := zstd.NewReader(nil,
+		zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxMemory(16<<20), // 16MB
+	)
+	if err != nil {
+		panic(err)
+	}
+	return dec
+}
+
+// compIO handles compression/decompression of MySQL packets.
+type compIO struct {
+	buff bytes.Buffer
+	mc   *mysqlConn
+	comp compressor
+}
+
+func newCompIO(mc *mysqlConn) *compIO {
+	c := &compIO{mc: mc}
+	if mc.cfg.zstdCompress {
+		level := zstd.EncoderLevelFromZstd(mc.cfg.zstdCompressionLevel)
+		c.comp = &zstdCompressor{
+			encoder: sharedZstdEncoder(level),
+			decoder: sharedZstdDecoder(),
+		}
+	} else {
+		c.comp = &zlibCompressor{level: mc.cfg.zlibCompressionLevel}
+	}
+	return c
+}
+
+func (c *compIO) close() {
+	c.comp.cleanup()
+	c.mc = nil
+}
+
+const maxIdleBufferSize = 1 << 16 // 64KB
+
 func (c *compIO) reset() {
-	c.buff.Reset()
+	// Release large buffers to reduce memory when idle.
+	if c.buff.Cap() > maxIdleBufferSize {
+		c.buff = bytes.Buffer{}
+	} else {
+		c.buff.Reset()
+	}
+	c.comp.cleanup()
 }
 
 func (c *compIO) readNext(need int) ([]byte, error) {
@@ -95,51 +242,50 @@ func (c *compIO) readNext(need int) ([]byte, error) {
 }
 
 func (c *compIO) readCompressedPacket() error {
-	header, err := c.mc.readNext(7)
+	header, err := c.mc.readNext(compHeaderSize)
 	if err != nil {
 		return err
 	}
 	_ = header[6] // bounds check hint to compiler; guaranteed by readNext
 
-	// compressed header structure
-	comprLength := getUint24(header[0:3])
-	compressionSequence := header[3]
-	uncompressedLength := getUint24(header[4:7])
+	// Read compressed header data
+	var h compHeader
+	h.read(header)
 	if debug {
 		fmt.Printf("uncompress cmplen=%v uncomplen=%v pkt_cmp_seq=%v expected_cmp_seq=%v\n",
-			comprLength, uncompressedLength, compressionSequence, c.mc.sequence)
+			h.CompressedLength, h.UncompressedLength, h.Sequence, c.mc.compressSequence)
 	}
 	// Do not return ErrPktSync here.
 	// Server may return error packet (e.g. 1153 Got a packet bigger than 'max_allowed_packet' bytes)
 	// before receiving all packets from client. In this case, seqnr is younger than expected.
 	// NOTE: Both of mariadbclient and mysqlclient do not check seqnr. Only server checks it.
-	if debug && compressionSequence != c.mc.compressSequence {
-		fmt.Printf("WARN: unexpected cmpress seq nr: expected %v, got %v",
-			c.mc.compressSequence, compressionSequence)
+	if debug && h.Sequence != c.mc.compressSequence {
+		fmt.Printf("WARN: unexpected compress seq nr: expected %v, got %v",
+			c.mc.compressSequence, h.Sequence)
 	}
-	c.mc.compressSequence = compressionSequence + 1
+	c.mc.compressSequence = h.Sequence + 1
 
-	comprData, err := c.mc.readNext(comprLength)
+	comprData, err := c.mc.readNext(int(h.CompressedLength))
 	if err != nil {
 		return err
 	}
 
 	// if payload is uncompressed, its length will be specified as zero, and its
 	// true length is contained in comprLength
-	if uncompressedLength == 0 {
+	if h.UncompressedLength == 0 {
 		c.buff.Write(comprData)
 		return nil
 	}
 
 	// use existing capacity in bytesBuf if possible
-	c.buff.Grow(uncompressedLength)
-	nread, err := zDecompress(comprData, &c.buff)
+	c.buff.Grow(int(h.UncompressedLength))
+	nread, err := c.comp.uncompress(comprData, &c.buff)
 	if err != nil {
 		return err
 	}
-	if nread != uncompressedLength {
+	if nread != int(h.UncompressedLength) {
 		return fmt.Errorf("invalid compressed packet: uncompressed length in header is %d, actual %d",
-			uncompressedLength, nread)
+			h.UncompressedLength, nread)
 	}
 	return nil
 }
@@ -151,37 +297,40 @@ const maxPayloadLen = maxPacketSize - 4
 // Use this instead of mc.netConn.Write() when mc.compress is true.
 func (c *compIO) writePackets(packets []byte) (int, error) {
 	totalBytes := len(packets)
-	blankHeader := make([]byte, 7)
 	buf := &c.buff
 
+	var header compHeader
 	for len(packets) > 0 {
 		payloadLen := min(maxPayloadLen, len(packets))
 		payload := packets[:payloadLen]
-		uncompressedLen := payloadLen
+		header.UncompressedLength = uint32(payloadLen)
 
 		buf.Reset()
-		buf.Write(blankHeader) // Buffer.Write() never returns error
+		buf.Write(blankHeader[:]) // Buffer.Write() never returns error
 
 		// If payload is less than minCompressLength, don't compress.
-		if uncompressedLen < minCompressLength {
+		if header.UncompressedLength < minCompressLength {
 			buf.Write(payload)
-			uncompressedLen = 0
+			header.UncompressedLength = 0
 		} else {
-			err := zCompress(payload, buf)
-			if debug && err != nil {
-				fmt.Printf("zCompress error: %v", err)
+			err := c.comp.compress(payload, buf)
+			if err != nil {
+				c.mc.log("compress error:", err)
 			}
-			// do not compress if compressed data is larger than uncompressed data
-			// I intentionally miss 7 byte header in the buf; zCompress must compress more than 7 bytes.
-			if err != nil || buf.Len() >= uncompressedLen {
+			// do not compress if compressed data is larger than uncompressed data.
+			// The 7-byte header in buf is intentionally excluded from the comparison;
+			// compression must save more than the header overhead to be worthwhile.
+			if err != nil || buf.Len() >= int(header.UncompressedLength) {
 				buf.Reset()
-				buf.Write(blankHeader)
+				buf.Write(blankHeader[:])
 				buf.Write(payload)
-				uncompressedLen = 0
+				header.UncompressedLength = 0
 			}
 		}
+		header.CompressedLength = uint32(buf.Len() - compHeaderSize)
+		header.Sequence = c.mc.compressSequence
 
-		if n, err := c.writeCompressedPacket(buf.Bytes(), uncompressedLen); err != nil {
+		if n, err := c.writeCompressedPacket(&header); err != nil {
 			// To allow returning ErrBadConn when sending really 0 bytes, we sum
 			// up compressed bytes that is returned by underlying Write().
 			return totalBytes - len(packets) + n, err
@@ -194,20 +343,14 @@ func (c *compIO) writePackets(packets []byte) (int, error) {
 
 // writeCompressedPacket writes a compressed packet with header.
 // data should start with 7 size space for header followed by payload.
-func (c *compIO) writeCompressedPacket(data []byte, uncompressedLen int) (int, error) {
-	mc := c.mc
-	comprLength := len(data) - 7
+func (c *compIO) writeCompressedPacket(header *compHeader) (int, error) {
+	data := c.buff.Bytes()
+	header.write(data)
 	if debug {
 		fmt.Printf(
 			"writeCompressedPacket: comprLength=%v, uncompressedLen=%v, seq=%v\n",
-			comprLength, uncompressedLen, mc.compressSequence)
+			header.CompressedLength, header.UncompressedLength, header.Sequence)
 	}
-
-	// compression header
-	putUint24(data[0:3], comprLength)
-	data[3] = mc.compressSequence
-	putUint24(data[4:7], uncompressedLen)
-
-	mc.compressSequence++
-	return mc.writeWithTimeout(data)
+	c.mc.compressSequence++
+	return c.mc.writeWithTimeout(data)
 }

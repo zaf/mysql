@@ -179,7 +179,6 @@ func (mc *mysqlConn) cleanup() {
 	if mc.closed.Swap(true) {
 		return
 	}
-
 	// Makes cleanup idempotent
 	close(mc.closech)
 	conn := mc.rawConn
@@ -188,6 +187,9 @@ func (mc *mysqlConn) cleanup() {
 	}
 	if err := conn.Close(); err != nil {
 		mc.log("closing connection:", err)
+	}
+	if mc.compress {
+		mc.compIO.close()
 	}
 	// This function can be called from multiple goroutines.
 	// So we can not mc.clearResult() here.
@@ -723,7 +725,13 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 // IsValid implements driver.Validator interface
 // (From Go 1.15)
 func (mc *mysqlConn) IsValid() bool {
-	return !mc.closed.Load() && !mc.buf.busy()
+	if mc.closed.Load() || mc.buf.busy() {
+		return false
+	}
+	if mc.compress {
+		mc.compIO.reset()
+	}
+	return true
 }
 
 var _ driver.SessionResetter = &mysqlConn{}

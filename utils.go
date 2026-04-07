@@ -491,13 +491,16 @@ func formatBinaryTime(src []byte, length uint8) (driver.Value, error) {
 ******************************************************************************/
 
 // 24bit integer: used for packet headers.
+//
 
+//go:inline
 func putUint24(data []byte, n int) {
 	data[2] = byte(n >> 16)
 	data[1] = byte(n >> 8)
 	data[0] = byte(n)
 }
 
+//go:inline
 func getUint24(data []byte) int {
 	return int(data[2])<<16 | int(data[1])<<8 | int(data[0])
 }
